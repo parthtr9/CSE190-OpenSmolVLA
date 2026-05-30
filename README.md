@@ -59,7 +59,7 @@ CSE190-OpenSmolVLA/
 
 ## What Each File Does
 
-### Scripts (things you run)
+### Scripts
 
 #### `scripts/viewer.py` -- View the Scene
 
