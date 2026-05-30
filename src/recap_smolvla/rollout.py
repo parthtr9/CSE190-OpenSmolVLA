@@ -85,9 +85,16 @@ def collect_rollout(
             "instruction": instruction,
         }
         if image is not None:
-            obs_dict[render_key] = torch.tensor(
-                image.astype(np.float32) / 255.0
-            ).permute(2, 0, 1) if image.ndim == 3 else torch.tensor(image)
+            if isinstance(image, dict):
+                # Multi-camera env (e.g. MuJoCoGymWrapper) — pass dict through;
+                # _SmolVLAWrapper._to_batch handles camera-key mapping.
+                obs_dict[render_key] = image
+            elif isinstance(image, np.ndarray) and image.ndim == 3:
+                obs_dict[render_key] = torch.tensor(
+                    image.astype(np.float32) / 255.0
+                ).permute(2, 0, 1)
+            else:
+                obs_dict[render_key] = torch.tensor(image)
 
         action = policy.select_action(obs_dict)
         action_np = action.numpy() if hasattr(action, "numpy") else np.asarray(action)
