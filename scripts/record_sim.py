@@ -32,20 +32,12 @@ import time
 from pathlib import Path
 
 import numpy as np
-
-# ---------------------------------------------------------------------------
-# LeRobot imports (the lerobot package must be importable, e.g. via
-# ``pip install -e /path/to/lerobot`` or by adding it to PYTHONPATH).
-# ---------------------------------------------------------------------------
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.motors.feetech import FeetechMotorsBus
 from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
 
 from smolvla_recap.env.mujoco_follower import MuJoCoFollower, JOINT_NAMES
 
-# ---------------------------------------------------------------------------
-# Dataset feature specification
-# ---------------------------------------------------------------------------
 FEATURES = {
     "observation.state": {
         "dtype": "float32",

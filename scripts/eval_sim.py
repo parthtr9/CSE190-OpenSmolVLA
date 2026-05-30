@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import subprocess
 import sys
 import time
 import types
@@ -175,6 +176,7 @@ def evaluate(
     device: str,
     save_video: bool,
     video_dir: str,
+    randomize_cube: bool = False,
 ) -> None:
     # --- Load policy ---
     print(f"Loading policy from: {checkpoint}")
@@ -207,16 +209,25 @@ def evaluate(
         for ep in range(num_episodes):
             print(f"\n=== Episode {ep + 1}/{num_episodes} ===")
 
-            # Reset scene and policy
-            follower.reset(keyframe="ready")
+            # Reset scene and policy.  Cycle through cube positions so each
+            # position gets an equal share of episodes.
+            follower.reset(
+                keyframe="ready",
+                randomize_cube=randomize_cube,
+                cube_position_idx=ep if randomize_cube else None,
+            )
             policy.reset()
 
             video_writer = None
             if save_video:
                 video_path = out_dir / f"episode_{ep + 1:03d}.mp4"
                 # Side-by-side: 2 cameras at 640px each = 1280 wide
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                fourcc = cv2.VideoWriter_fourcc(*"avc1")
                 video_writer = cv2.VideoWriter(str(video_path), fourcc, fps, (1280, 480))
+                if not video_writer.isOpened():
+                    # Fall back to mp4v if H.264 is unavailable
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    video_writer = cv2.VideoWriter(str(video_path), fourcc, fps, (1280, 480))
 
             ep_start = time.perf_counter()
             success_detected = False
@@ -270,15 +281,25 @@ def evaluate(
 
             if video_writer is not None:
                 video_writer.release()
+                # Re-encode to H.264 so the video plays in VS Code / browsers
+                h264_path = video_path.with_stem(video_path.stem + "_h264")
+                try:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", str(video_path), "-c:v", "libx264",
+                         "-crf", "23", str(h264_path)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+                    )
+                    video_path.unlink()  # remove the mp4v original
+                    h264_path.rename(video_path)  # rename h264 back to original name
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    pass  # ffmpeg not available, keep the mp4v file as-is
 
             ep_elapsed = time.perf_counter() - ep_start
             status = "SUCCESS" if success_detected else "FAIL"
             results.append(success_detected)
             print(f"  [{status}] {max_steps} steps in {ep_elapsed:.1f}s")
 
-            if save_video and success_detected:
-                print(f"  Video saved: {video_path}")
-            elif save_video:
+            if save_video:
                 print(f"  Video saved: {video_path}")
 
             # In viewer mode, wait for user between episodes
@@ -358,6 +379,11 @@ def main():
         default="outputs/eval_videos",
         help="Directory to save videos (default: outputs/eval_videos).",
     )
+    parser.add_argument(
+        "--randomize-cube",
+        action="store_true",
+        help="Randomize cube position on the table each episode.",
+    )
     args = parser.parse_args()
 
     evaluate(
@@ -369,6 +395,7 @@ def main():
         device=args.device,
         save_video=args.save_video,
         video_dir=args.video_dir,
+        randomize_cube=args.randomize_cube,
     )
 
 
