@@ -287,7 +287,7 @@ uv run python -m lerobot.scripts.train \
 
 ## Project Roadmap
 
-### Phase 1: BC Pre-training (current)
+### Phase 1: BC Pre-training 
 
 1. Collect teleoperated demos in MuJoCo sim
 2. Fine-tune SmolVLA with behavioral cloning
