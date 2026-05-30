@@ -1,0 +1,468 @@
+"""
+Ablation 1: Sparse vs Dense Reward in RECAP.
+
+Runs the full RECAP loop for both reward variants and produces:
+  - advantage_comparison.png  — advantage distribution at each iteration
+  - recap_comparison.png      — success rate curves
+
+Usage
+-----
+    python experiments/ablation_sparse_vs_dense.py
+    python experiments/ablation_sparse_vs_dense.py --n_iters 5 --n_rollouts 100
+
+With gym_pusht installed:
+    python experiments/ablation_sparse_vs_dense.py --env pusht
+
+With mock env (default, no extra deps):
+    python experiments/ablation_sparse_vs_dense.py --env mock
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+# Make package importable from repo root without install
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from recap_smolvla.rewards import sparse_reward_fn, dense_reward_fn
+from recap_smolvla.rollout import MockEnv, make_dummy_rollouts, collect_rollout, ScriptedMockPolicy
+from recap_smolvla.value_function import ValueFunction
+from recap_smolvla.advantage import label_trajectories, advantage_distribution_stats
+from recap_smolvla.training import recap_training_iteration, finetune_smolvla
+
+
+# ---------------------------------------------------------------------------
+# Mock policy (no lerobot required)
+# ---------------------------------------------------------------------------
+
+import torch.nn as nn
+
+
+class _MockPolicy(nn.Module):
+    def __init__(self, obs_dim: int = 4, action_dim: int = 2) -> None:
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(obs_dim, 64), nn.ReLU(), nn.Linear(64, action_dim)
+        )
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+
+    def select_action(self, obs_dict: dict) -> np.ndarray:
+        key = "observation.state" if "observation.state" in obs_dict else "obs"
+        obs = obs_dict.get(key, np.zeros(self.obs_dim))
+        if isinstance(obs, torch.Tensor):
+            obs = obs.float()
+        else:
+            obs = torch.tensor(np.asarray(obs, dtype=np.float32))
+        obs = obs.reshape(-1)[: self.obs_dim]
+        with torch.no_grad():
+            return self.head(obs).numpy()
+
+    def compute_loss(self, batch: dict) -> torch.Tensor:
+        key = "observation.state" if "observation.state" in batch else "obs"
+        obs = batch.get(key, np.zeros(self.obs_dim))
+        if isinstance(obs, torch.Tensor):
+            obs = obs.float()
+        else:
+            obs = torch.tensor(np.asarray(obs, dtype=np.float32))
+        obs = obs.reshape(-1)[: self.obs_dim]
+        pred = self.head(obs)
+        target = torch.tensor(
+            np.asarray(batch["action"], dtype=np.float32)[: self.action_dim]
+        )
+        return nn.functional.mse_loss(pred, target)
+
+
+# ---------------------------------------------------------------------------
+# Environment factory
+# ---------------------------------------------------------------------------
+
+def make_env(env_name: str, seed: int = 0):
+    if env_name == "pusht":
+        import gymnasium as gym
+        import gym_pusht  # noqa: F401
+        env = gym.make("gym_pusht/PushT-v0", render_mode="rgb_array")
+        env.reset(seed=seed)
+        return env
+    # success_prob=0.0: physics-only success so a random policy truly struggles
+    return MockEnv(max_steps=50, success_prob=0.0, seed=seed)
+
+
+# ---------------------------------------------------------------------------
+# Policy factory
+# ---------------------------------------------------------------------------
+
+def make_policy(policy_name: str, obs_dim: int, action_dim: int, env_name: str):
+    """Return a policy instance.  'smolvla' loads the real pretrained model."""
+    if policy_name == "smolvla":
+        return _load_smolvla()
+    # Default: lightweight mock MLP
+    return _MockPolicy(obs_dim=obs_dim, action_dim=action_dim)
+
+
+def _load_smolvla():
+    """Load SmolVLA from HuggingFace Hub with a compute_loss shim."""
+    try:
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy as _SV
+    except ImportError:
+        try:
+            from lerobot.common.policies.smolvla.modeling_smolvla import SmolVLAPolicy as _SV
+        except ImportError:
+            raise ImportError(
+                "Cannot import SmolVLAPolicy. "
+                "Make sure lerobot 0.5+ is installed: pip install lerobot"
+            )
+
+    print("Loading SmolVLA from lerobot/smolvla_base (this may take a minute)...")
+    policy = _SV.from_pretrained("lerobot/smolvla_base")
+    policy.eval()
+
+    # Discover what image keys this checkpoint actually expects
+    image_keys: list[str] = []
+    try:
+        for k, v in policy.config.input_features.items():
+            if "VISUAL" in str(getattr(v, "type", "")):
+                image_keys.append(k)
+    except Exception:
+        pass
+    if not image_keys:
+        image_keys = ["observation.images.top"]
+    print(f"  Model expects image keys: {image_keys}")
+
+    policy = _SmolVLAWrapper(policy, image_keys=image_keys)
+    print("SmolVLA loaded.")
+    return policy
+
+
+class _SmolVLAWrapper(torch.nn.Module):
+    """Thin wrapper giving SmolVLA the compute_loss / select_action interface."""
+
+    def __init__(self, smolvla, image_keys: list[str] | None = None):
+        super().__init__()
+        self._model = smolvla
+        self._image_keys = image_keys or ["observation.images.top"]
+        # Grab the tokenizer from inside the model for language conditioning
+        try:
+            self._tokenizer = smolvla.model.vlm_with_expert.processor.tokenizer
+        except AttributeError:
+            self._tokenizer = None
+        # Detect model device so we can move batch tensors to it
+        try:
+            self._device = next(smolvla.parameters()).device
+        except StopIteration:
+            self._device = torch.device("cpu")
+
+    def _tokenize(self, task: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (input_ids, attention_mask) tensors for a task string."""
+        if self._tokenizer is None:
+            # Fallback: empty tokens if we can't reach the tokenizer
+            ids = torch.zeros((1, 1), dtype=torch.long)
+            return ids, torch.ones_like(ids, dtype=torch.bool)
+        enc = self._tokenizer(
+            task,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=getattr(self._tokenizer, "model_max_length", 128),
+            truncation=True,
+        )
+        return enc["input_ids"], enc["attention_mask"].bool()
+
+    def select_action(self, obs_dict: dict) -> np.ndarray:
+        with torch.no_grad():
+            batch = self._to_batch(obs_dict)
+            action = self._model.select_action(batch)
+            if isinstance(action, torch.Tensor):
+                return action.cpu().numpy().flatten()
+            return np.asarray(action).flatten()
+
+    def compute_loss(self, batch: dict) -> torch.Tensor:
+        sv_batch = self._to_batch(batch)
+        out = self._model.forward(sv_batch)
+        if isinstance(out, torch.Tensor):
+            return out
+        if hasattr(out, "loss"):
+            return out.loss
+        return torch.tensor(0.0, requires_grad=True)
+
+    def _to_batch(self, obs_dict: dict) -> dict:
+        batch = _to_smolvla_batch(obs_dict, image_keys=self._image_keys)
+        # Tokenize the task instruction and add language token keys
+        task = obs_dict.get("instruction", "push the block to the goal")
+        if isinstance(task, list):
+            task = task[0]
+        ids, mask = self._tokenize(str(task))
+        batch["observation.language.tokens"] = ids
+        batch["observation.language.attention_mask"] = mask
+        # Move every tensor to the model's device (CPU → MPS or CUDA)
+        return {
+            k: v.to(self._device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+
+    def parameters(self, recurse=True):
+        return self._model.parameters(recurse=recurse)
+
+    def named_parameters(self, prefix="", recurse=True, remove_duplicate=True):
+        return self._model.named_parameters(prefix=prefix, recurse=recurse)
+
+    def zero_grad(self, set_to_none=True):
+        self._model.zero_grad(set_to_none=set_to_none)
+
+
+def _to_smolvla_batch(obs_dict: dict, image_keys: list[str] | None = None) -> dict:
+    """Convert our generic obs_dict format to the format SmolVLA expects."""
+    import torch
+    batch = {}
+
+    # Image: render output lives under "observation.image" in collect_rollout
+    image = obs_dict.get("observation.image")
+    if image is None:
+        image = obs_dict.get("image")
+    if image is not None:
+        if isinstance(image, np.ndarray):
+            img_t = torch.from_numpy(image.astype(np.float32))
+            if img_t.ndim == 3:               # H×W×C → C×H×W
+                img_t = img_t.permute(2, 0, 1)
+            if img_t.max() > 1.0:
+                img_t = img_t / 255.0
+            img_t = torch.nn.functional.interpolate(
+                img_t.unsqueeze(0), size=(256, 256), mode="bilinear", align_corners=False
+            )
+        else:
+            img_t = image
+            if img_t.ndim == 3:
+                img_t = img_t.unsqueeze(0)
+        # Broadcast the single PushT image to every camera key the model expects
+        for key in (image_keys or ["observation.images.top"]):
+            batch[key] = img_t
+
+    # State
+    for key in ("obs", "observation.state"):
+        if key in obs_dict:
+            v = obs_dict[key]
+            state = v if isinstance(v, torch.Tensor) else torch.tensor(
+                np.asarray(v, dtype=np.float32)
+            )
+            batch["observation.state"] = state.unsqueeze(0) if state.ndim == 1 else state
+            break
+
+    # Action (for compute_loss)
+    if "action" in obs_dict:
+        v = obs_dict["action"]
+        act = v if isinstance(v, torch.Tensor) else torch.tensor(np.asarray(v, dtype=np.float32))
+        batch["action"] = act.unsqueeze(0) if act.ndim == 1 else act
+
+    return batch
+
+
+# ---------------------------------------------------------------------------
+# Per-iteration advantage plot
+# ---------------------------------------------------------------------------
+
+def plot_advantage_distribution(
+    sparse_advs: list[list[float]],
+    dense_advs: list[list[float]],
+    out_path: Path,
+) -> None:
+    n_iters = len(sparse_advs)
+    fig, axes = plt.subplots(2, n_iters, figsize=(5 * n_iters, 8), squeeze=False)
+
+    for i in range(n_iters):
+        for row, (advs, name, color) in enumerate(
+            [(sparse_advs[i], "Sparse", "#182B49"), (dense_advs[i], "Dense", "#1D9E75")]
+        ):
+            ax = axes[row][i]
+            arr = np.array(advs)
+            ax.hist(arr, bins=30, color=color, alpha=0.8, edgecolor="white")
+            ax.axvline(0, color="red", linestyle="--", linewidth=1.5, label="zero")
+            pct_pos = float(np.mean(arr > 0)) * 100
+            ax.set_title(f"{name} — Iter {i+1}\n{pct_pos:.1f}% positive", fontsize=9)
+            ax.set_xlabel("Advantage A(s,a)")
+            if i == 0:
+                ax.set_ylabel("Count")
+
+    plt.suptitle("Advantage Distribution: Sparse vs Dense Reward", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"  Saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Success rate plot
+# ---------------------------------------------------------------------------
+
+def plot_success_curves(
+    results: dict,
+    baseline: float,
+    out_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    iters = list(range(1, len(results["sparse"]["success_rates"]) + 1))
+
+    ax.plot(
+        iters, results["sparse"]["success_rates"],
+        "o-", color="#182B49", label="RECAP (sparse)", linewidth=2, markersize=7,
+    )
+    ax.plot(
+        iters, results["dense"]["success_rates"],
+        "o-", color="#1D9E75", label="RECAP (dense)", linewidth=2, markersize=7,
+    )
+    ax.axhline(baseline, color="gray", linestyle="--", linewidth=1.5, label="BC baseline")
+
+    ax.set_xlabel("RECAP Iteration")
+    ax.set_ylabel("Success Rate")
+    ax.set_title("Dense vs Sparse Reward in RECAP\nSuccess Rate over Training Iterations")
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"  Saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main experiment loop
+# ---------------------------------------------------------------------------
+
+def run_experiment(
+    env_name: str = "mock",
+    policy_name: str = "mock",
+    n_iters: int = 3,
+    n_rollouts: int = 30,
+    vf_epochs: int = 30,
+    ft_epochs: int = 5,
+    out_dir: str = "results",
+    seed: int = 0,
+) -> dict:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    env = make_env(env_name, seed=seed)
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+
+    # PushT goal position is accessible via the unwrapped env
+    unwrapped = getattr(env, "unwrapped", env)
+    goal_pos = getattr(unwrapped, "goal_pos", np.array([256.0, 256.0]))
+    # Normalise pixel-space goals to [0,1] for the dense reward function
+    if goal_pos.max() > 1.0:
+        goal_pos = goal_pos / 512.0   # PushT renders at 512×512
+
+    reward_configs = {
+        "sparse": lambda traj, suc: sparse_reward_fn(traj, suc),
+        "dense": lambda traj, suc: dense_reward_fn(traj, suc, goal_pos),
+    }
+
+    results: dict = {
+        "sparse": {"success_rates": [], "pct_positive": [], "advantages": []},
+        "dense": {"success_rates": [], "pct_positive": [], "advantages": []},
+    }
+
+    # Baseline success rate
+    print(f"Measuring baseline success rate ({policy_name} policy)...")
+    baseline_env = make_env(env_name, seed=seed + 99)
+    baseline_policy = make_policy(policy_name, obs_dim, action_dim, env_name)
+    baseline_rollouts = []
+    max_ep_steps = 300 if env_name == "pusht" else 50
+    for _ in range(min(n_rollouts, 20)):
+        traj, suc = collect_rollout(baseline_policy, baseline_env, max_steps=max_ep_steps)
+        baseline_rollouts.append((traj, suc))
+    baseline_sr = float(np.mean([s for _, s in baseline_rollouts]))
+    print(f"Baseline success rate: {baseline_sr:.2%}")
+
+    for reward_name, reward_fn in reward_configs.items():
+        print(f"\n{'=' * 50}")
+        print(f"RECAP with {reward_name} reward  [{policy_name} policy]")
+        print("=" * 50)
+
+        policy = make_policy(policy_name, obs_dim, action_dim, env_name)
+        value_fn = ValueFunction(obs_dim=obs_dim)
+
+        for iteration in range(n_iters):
+            print(f"\n  Iteration {iteration + 1}/{n_iters}")
+            sr, policy, value_fn, stats = recap_training_iteration(
+                policy,
+                value_fn,
+                env,
+                reward_fn,
+                n_rollouts=n_rollouts,
+                vf_epochs=vf_epochs,
+                ft_epochs=ft_epochs,
+                verbose=True,
+                max_steps=max_ep_steps,
+            )
+            results[reward_name]["success_rates"].append(sr)
+            pct_pos = stats.get("pct_positive", 0.0)
+            results[reward_name]["pct_positive"].append(pct_pos)
+            # Collect advantages for distribution plot
+            from recap_smolvla.rollout import make_dummy_rollouts as mdr
+            sample_rollouts = mdr(n=10, obs_dim=obs_dim, seed=iteration)
+            labeled = label_trajectories(sample_rollouts, value_fn, reward_fn)
+            results[reward_name]["advantages"].append(
+                [d["advantage"] for d in labeled]
+            )
+            print(f"  SR={sr:.2%}  pct_positive={pct_pos:.1%}")
+
+    # Plots
+    plot_advantage_distribution(
+        results["sparse"]["advantages"],
+        results["dense"]["advantages"],
+        out / "advantage_comparison.png",
+    )
+    plot_success_curves(results, baseline_sr, out / "recap_comparison.png")
+
+    # Save results JSON
+    summary = {
+        "baseline_success_rate": baseline_sr,
+        "sparse_success_rates": results["sparse"]["success_rates"],
+        "dense_success_rates": results["dense"]["success_rates"],
+        "sparse_pct_positive": results["sparse"]["pct_positive"],
+        "dense_pct_positive": results["dense"]["pct_positive"],
+    }
+    (out / "results_sparse_vs_dense.json").write_text(json.dumps(summary, indent=2))
+    print(f"\nResults saved to {out}/results_sparse_vs_dense.json")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Ablation: Sparse vs Dense RECAP reward")
+    p.add_argument("--env", choices=["mock", "pusht"], default="mock",
+                   help="Environment: 'mock' (fast local) or 'pusht' (real gym env)")
+    p.add_argument("--policy", choices=["mock", "smolvla"], default="mock",
+                   help="Policy backbone: 'mock' (MLP) or 'smolvla' (real pretrained model)")
+    p.add_argument("--n_iters", type=int, default=3)
+    p.add_argument("--n_rollouts", type=int, default=30)
+    p.add_argument("--vf_epochs", type=int, default=30)
+    p.add_argument("--ft_epochs", type=int, default=5)
+    p.add_argument("--out_dir", default="results")
+    p.add_argument("--seed", type=int, default=0)
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    run_experiment(
+        env_name=args.env,
+        policy_name=args.policy,
+        n_iters=args.n_iters,
+        n_rollouts=args.n_rollouts,
+        vf_epochs=args.vf_epochs,
+        ft_epochs=args.ft_epochs,
+        out_dir=args.out_dir,
+        seed=args.seed,
+    )
