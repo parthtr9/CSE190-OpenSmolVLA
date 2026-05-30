@@ -14,6 +14,7 @@ dependencies = [
     "gymnasium>=0.29.0",
     "matplotlib>=3.8.0",
     "tqdm>=4.66.0",
+    "mujoco>=3.0",
 ]
 
 [project.optional-dependencies]

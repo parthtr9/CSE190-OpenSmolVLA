@@ -91,6 +91,9 @@ def make_env(env_name: str, seed: int = 0):
         env = gym.make("gym_pusht/PushT-v0", render_mode="rgb_array")
         env.reset(seed=seed)
         return env
+    if env_name == "mujoco":
+        from recap_smolvla.envs.mujoco_env import MuJoCoGymWrapper
+        return MuJoCoGymWrapper(randomize_cube=True, max_steps=750)
     # success_prob=0.0: physics-only success so a random policy truly struggles
     return MockEnv(max_steps=50, success_prob=0.0, seed=seed)
 
@@ -99,15 +102,16 @@ def make_env(env_name: str, seed: int = 0):
 # Policy factory
 # ---------------------------------------------------------------------------
 
-def make_policy(policy_name: str, obs_dim: int, action_dim: int, env_name: str):
+def make_policy(policy_name: str, obs_dim: int, action_dim: int, env_name: str,
+                checkpoint: str = "lerobot/smolvla_base"):
     """Return a policy instance.  'smolvla' loads the real pretrained model."""
     if policy_name == "smolvla":
-        return _load_smolvla()
+        return _load_smolvla(checkpoint)
     # Default: lightweight mock MLP
     return _MockPolicy(obs_dim=obs_dim, action_dim=action_dim)
 
 
-def _load_smolvla():
+def _load_smolvla(checkpoint: str = "lerobot/smolvla_base"):
     """Load SmolVLA from HuggingFace Hub with a compute_loss shim."""
     try:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy as _SV
@@ -120,8 +124,8 @@ def _load_smolvla():
                 "Make sure lerobot 0.5+ is installed: pip install lerobot"
             )
 
-    print("Loading SmolVLA from lerobot/smolvla_base (this may take a minute)...")
-    policy = _SV.from_pretrained("lerobot/smolvla_base")
+    print(f"Loading SmolVLA from {checkpoint} (this may take a minute)...")
+    policy = _SV.from_pretrained(checkpoint)
     policy.eval()
 
     # Discover what image keys this checkpoint actually expects
@@ -132,8 +136,15 @@ def _load_smolvla():
                 image_keys.append(k)
     except Exception:
         pass
+    # Gueso checkpoint uses front_camera/wrist_camera; base uses camera1/2/3
     if not image_keys:
-        image_keys = ["observation.images.top"]
+        if "Gueso" in checkpoint or "recordpolicy" in checkpoint:
+            image_keys = [
+                "observation.images.front_camera",
+                "observation.images.wrist_camera",
+            ]
+        else:
+            image_keys = ["observation.images.top"]
     print(f"  Model expects image keys: {image_keys}")
 
     policy = _SmolVLAWrapper(policy, image_keys=image_keys)
@@ -216,32 +227,47 @@ class _SmolVLAWrapper(torch.nn.Module):
         self._model.zero_grad(set_to_none=set_to_none)
 
 
+def _img_to_tensor(image) -> "torch.Tensor":
+    """Convert a single HWC uint8/float image to a (1,C,H,W) float32 tensor."""
+    import torch
+    if isinstance(image, np.ndarray):
+        img_t = torch.from_numpy(image.astype(np.float32))
+        if img_t.ndim == 3:
+            img_t = img_t.permute(2, 0, 1)
+        if img_t.max() > 1.0:
+            img_t = img_t / 255.0
+        img_t = torch.nn.functional.interpolate(
+            img_t.unsqueeze(0), size=(256, 256), mode="bilinear", align_corners=False
+        )
+    else:
+        img_t = image
+        if img_t.ndim == 3:
+            img_t = img_t.unsqueeze(0)
+    return img_t
+
+
 def _to_smolvla_batch(obs_dict: dict, image_keys: list[str] | None = None) -> dict:
     """Convert our generic obs_dict format to the format SmolVLA expects."""
     import torch
     batch = {}
 
-    # Image: render output lives under "observation.image" in collect_rollout
+    # Image: render output lives under "observation.image" in collect_rollout.
+    # MuJoCoGymWrapper.render() returns a dict {"front_camera": img, "wrist_camera": img}.
+    # PushT/MockEnv render() returns a single numpy array.
     image = obs_dict.get("observation.image")
     if image is None:
         image = obs_dict.get("image")
     if image is not None:
-        if isinstance(image, np.ndarray):
-            img_t = torch.from_numpy(image.astype(np.float32))
-            if img_t.ndim == 3:               # H×W×C → C×H×W
-                img_t = img_t.permute(2, 0, 1)
-            if img_t.max() > 1.0:
-                img_t = img_t / 255.0
-            img_t = torch.nn.functional.interpolate(
-                img_t.unsqueeze(0), size=(256, 256), mode="bilinear", align_corners=False
-            )
+        if isinstance(image, dict):
+            # Multi-camera dict from MuJoCoGymWrapper — map each camera directly
+            for cam_name, cam_img in image.items():
+                obs_key = f"observation.images.{cam_name}"
+                batch[obs_key] = _img_to_tensor(cam_img)
         else:
-            img_t = image
-            if img_t.ndim == 3:
-                img_t = img_t.unsqueeze(0)
-        # Broadcast the single PushT image to every camera key the model expects
-        for key in (image_keys or ["observation.images.top"]):
-            batch[key] = img_t
+            img_t = _img_to_tensor(image)
+            # Broadcast the single image to every camera key the model expects
+            for key in (image_keys or ["observation.images.top"]):
+                batch[key] = img_t
 
     # State
     for key in ("obs", "observation.state"):
@@ -342,6 +368,7 @@ def run_experiment(
     ft_epochs: int = 5,
     out_dir: str = "results",
     seed: int = 0,
+    checkpoint: str = "lerobot/smolvla_base",
 ) -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -352,17 +379,24 @@ def run_experiment(
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    # PushT goal position is accessible via the unwrapped env
-    unwrapped = getattr(env, "unwrapped", env)
-    goal_pos = getattr(unwrapped, "goal_pos", np.array([256.0, 256.0]))
-    # Normalise pixel-space goals to [0,1] for the dense reward function
-    if goal_pos.max() > 1.0:
-        goal_pos = goal_pos / 512.0   # PushT renders at 512×512
-
-    reward_configs = {
-        "sparse": lambda traj, suc: sparse_reward_fn(traj, suc),
-        "dense": lambda traj, suc: dense_reward_fn(traj, suc, goal_pos),
-    }
+    # PushT goal position is accessible via the unwrapped env; MuJoCo uses site-based reward
+    if env_name == "mujoco":
+        from recap_smolvla.envs.mujoco_env import MuJoCoGymWrapper
+        reward_configs = {
+            "sparse": lambda traj, suc: sparse_reward_fn(traj, suc),
+            "dense": lambda traj, suc: sparse_reward_fn(traj, suc),  # overridden by env reward_mode
+        }
+        max_ep_steps = 750
+    else:
+        unwrapped = getattr(env, "unwrapped", env)
+        goal_pos = getattr(unwrapped, "goal_pos", np.array([256.0, 256.0]))
+        if goal_pos.max() > 1.0:
+            goal_pos = goal_pos / 512.0
+        reward_configs = {
+            "sparse": lambda traj, suc: sparse_reward_fn(traj, suc),
+            "dense": lambda traj, suc: dense_reward_fn(traj, suc, goal_pos),
+        }
+        max_ep_steps = 300 if env_name == "pusht" else 50
 
     results: dict = {
         "sparse": {"success_rates": [], "pct_positive": [], "advantages": []},
@@ -372,9 +406,8 @@ def run_experiment(
     # Baseline success rate
     print(f"Measuring baseline success rate ({policy_name} policy)...")
     baseline_env = make_env(env_name, seed=seed + 99)
-    baseline_policy = make_policy(policy_name, obs_dim, action_dim, env_name)
+    baseline_policy = make_policy(policy_name, obs_dim, action_dim, env_name, checkpoint=checkpoint)
     baseline_rollouts = []
-    max_ep_steps = 300 if env_name == "pusht" else 50
     for _ in range(min(n_rollouts, 20)):
         traj, suc = collect_rollout(baseline_policy, baseline_env, max_steps=max_ep_steps)
         baseline_rollouts.append((traj, suc))
@@ -386,7 +419,7 @@ def run_experiment(
         print(f"RECAP with {reward_name} reward  [{policy_name} policy]")
         print("=" * 50)
 
-        policy = make_policy(policy_name, obs_dim, action_dim, env_name)
+        policy = make_policy(policy_name, obs_dim, action_dim, env_name, checkpoint=checkpoint)
         value_fn = ValueFunction(obs_dim=obs_dim)
 
         for iteration in range(n_iters):
@@ -441,10 +474,14 @@ def run_experiment(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Ablation: Sparse vs Dense RECAP reward")
-    p.add_argument("--env", choices=["mock", "pusht"], default="mock",
-                   help="Environment: 'mock' (fast local) or 'pusht' (real gym env)")
+    p.add_argument("--env", choices=["mock", "pusht", "mujoco"], default="mock",
+                   help="Environment: 'mock', 'pusht', or 'mujoco' (SO-101 cube-bin)")
     p.add_argument("--policy", choices=["mock", "smolvla"], default="mock",
                    help="Policy backbone: 'mock' (MLP) or 'smolvla' (real pretrained model)")
+    p.add_argument("--checkpoint", default="lerobot/smolvla_base",
+                   help="HuggingFace repo or local path for SmolVLA checkpoint "
+                        "(default: lerobot/smolvla_base; use Gueso/hf_smolvla_recordpolicy0 "
+                        "for the BC-trained SO-101 policy)")
     p.add_argument("--n_iters", type=int, default=3)
     p.add_argument("--n_rollouts", type=int, default=30)
     p.add_argument("--vf_epochs", type=int, default=30)
@@ -465,4 +502,5 @@ if __name__ == "__main__":
         ft_epochs=args.ft_epochs,
         out_dir=args.out_dir,
         seed=args.seed,
+        checkpoint=args.checkpoint,
     )
