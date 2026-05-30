@@ -1,0 +1,38 @@
+[project]
+name = "smolvla-recap"
+version = "0.1.0"
+description = "SmolVLA + RECAP: Reinforcement Learning with Advantage Conditioning for VLA"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "transformers",
+    "accelerate",
+    "datasets",
+    "wandb",
+    "safetensors",
+    "pillow",
+    "numpy",
+    "mujoco>=3.0",
+    "gymnasium>=1.0",
+    "opencv-python",
+    "lerobot",
+    "num2words>=0.5.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
