@@ -24,6 +24,7 @@ from recap_smolvla.data import (
     offline_eval_metrics,
     MockLeRobotDataset,
 )
+from recap_smolvla.envs.mujoco_env import MuJoCoGymWrapper
 
 __all__ = [
     "sparse_reward_fn",
@@ -40,4 +41,5 @@ __all__ = [
     "split_rollouts",
     "offline_eval_metrics",
     "MockLeRobotDataset",
+    "MuJoCoGymWrapper",
 ]
