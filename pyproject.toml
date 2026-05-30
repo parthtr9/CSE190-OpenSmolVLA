@@ -16,7 +16,7 @@ dependencies = [
     "mujoco>=3.0",
     "gymnasium>=1.0",
     "opencv-python",
-    "lerobot",
+    "lerobot>=0.5.1",
     "num2words>=0.5.14",
 ]
 
