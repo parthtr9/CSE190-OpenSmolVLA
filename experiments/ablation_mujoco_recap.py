@@ -48,7 +48,13 @@ from recap_smolvla.envs.mujoco_env import MuJoCoGymWrapper
 # ---------------------------------------------------------------------------
 
 def _load_smolvla(checkpoint: str, device: str = "cuda"):
-    """Load SmolVLA with compute_loss shim. Falls back to mock if unavailable."""
+    """Load SmolVLA with normalization shim.
+
+    Loads the checkpoint's preprocessing/postprocessing safetensors so that:
+      - observation.state is MEAN_STD-normalized before the model
+      - actions are MEAN_STD-denormalized after the model (raw [-100, 100])
+    This matches the training pipeline exactly and is required for non-zero SR.
+    """
     try:
         import types
         import sys as _sys
@@ -81,13 +87,52 @@ def _load_smolvla(checkpoint: str, device: str = "cuda"):
     except Exception:
         pass
     if not image_keys:
-        # Gueso checkpoint trained with front_camera + wrist_camera
         image_keys = [
             "observation.images.front_camera",
             "observation.images.wrist_camera",
         ]
     print(f"  Image keys: {image_keys}")
-    return _SmolVLAWrapper(policy, image_keys=image_keys)
+
+    # ------------------------------------------------------------------
+    # Load normalization statistics from the checkpoint safetensors.
+    # Without these the model sees out-of-distribution inputs and the
+    # actions come back in unit scale (≈[-3, 3]) rather than [-100, 100].
+    # ------------------------------------------------------------------
+    state_mean = state_std = action_mean = action_std = None
+    try:
+        from safetensors import safe_open
+        from huggingface_hub import hf_hub_download
+
+        pre_path = hf_hub_download(
+            checkpoint,
+            "policy_preprocessor_step_5_normalizer_processor.safetensors",
+        )
+        with safe_open(pre_path, framework="pt") as f:
+            state_mean = f.get_tensor("observation.state.mean").numpy()
+            state_std  = f.get_tensor("observation.state.std").numpy()
+
+        post_path = hf_hub_download(
+            checkpoint,
+            "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+        )
+        with safe_open(post_path, framework="pt") as f:
+            action_mean = f.get_tensor("action.mean").numpy()
+            action_std  = f.get_tensor("action.std").numpy()
+
+        print(f"  State  mean: {state_mean.round(2)}, std: {state_std.round(2)}")
+        print(f"  Action mean: {action_mean.round(2)}, std: {action_std.round(2)}")
+    except Exception as e:
+        print(f"  WARNING: could not load normalization stats ({e}). SR will be ~0%.")
+
+    return _SmolVLAWrapper(
+        policy,
+        image_keys=image_keys,
+        state_mean=state_mean,
+        state_std=state_std,
+        action_mean=action_mean,
+        action_std=action_std,
+        tokenizer_max_length=48,
+    )
 
 
 class _MockPolicy(torch.nn.Module):
@@ -152,6 +197,11 @@ def collect_mujoco_rollout(
     from recap_smolvla.envs.mujoco_env import _cube_bin_distance
 
     obs, _ = env.reset()
+    # SmolVLA keeps an action queue that must be cleared at every episode
+    # boundary, otherwise stale actions from the previous episode carry over.
+    if hasattr(policy, "reset"):
+        policy.reset()
+
     trajectory = []
     done = False
     success = False
@@ -253,6 +303,7 @@ def run_experiment(
     out_dir: str = "runs/mujoco_recap",
     device: str = "cuda",
     seed: int = 0,
+    max_ep_steps: int = 750,
 ) -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -260,10 +311,10 @@ def run_experiment(
     np.random.seed(seed)
 
     print(f"Policy: {policy_name}  Checkpoint: {checkpoint}")
-    print(f"Env: MuJoCo SO-101 cube-bin, 3-position cube randomization, max 750 steps")
+    print(f"Env: MuJoCo SO-101 cube-bin, 3-position cube randomization, max {max_ep_steps} steps")
     print(f"RECAP: {n_iters} iters × {n_rollouts} rollouts, VF={vf_epochs}ep, FT={ft_epochs}ep")
 
-    env = MuJoCoGymWrapper(randomize_cube=True, max_steps=750)
+    env = MuJoCoGymWrapper(randomize_cube=True, max_steps=max_ep_steps)
     obs_dim = env.observation_space.shape[0]   # 6
 
     def load_policy():
@@ -378,6 +429,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda",
                    help="Torch device for policy inference (cuda/cpu/mps)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max_ep_steps", type=int, default=750,
+                   help="Max steps per episode (default 750 = 25s at 30Hz; use 200 for faster runs)")
     return p.parse_args()
 
 
@@ -393,4 +446,5 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         device=args.device,
         seed=args.seed,
+        max_ep_steps=args.max_ep_steps,
     )

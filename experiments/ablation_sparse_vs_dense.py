@@ -153,9 +153,29 @@ def _load_smolvla(checkpoint: str = "lerobot/smolvla_base"):
 
 
 class _SmolVLAWrapper(torch.nn.Module):
-    """Thin wrapper giving SmolVLA the compute_loss / select_action interface."""
+    """Thin wrapper giving SmolVLA the compute_loss / select_action interface.
 
-    def __init__(self, smolvla, image_keys: list[str] | None = None):
+    Handles the three normalization steps the checkpoint's preprocessing
+    pipeline applies:
+      1. State: MEAN_STD normalize before passing to the model.
+      2. Action: MEAN_STD denormalize after select_action (model outputs
+         unit-scale actions; send_action expects raw [-100, 100]).
+      3. Images: passed as [0, 1] floats; SigLIP rescaling ([0,1]→[-1,1])
+         is done internally by prepare_images.
+    Pass state_mean/state_std/action_mean/action_std loaded from the
+    checkpoint's safetensors to enable correct normalization.
+    """
+
+    def __init__(
+        self,
+        smolvla,
+        image_keys: list[str] | None = None,
+        state_mean: "np.ndarray | None" = None,
+        state_std: "np.ndarray | None" = None,
+        action_mean: "np.ndarray | None" = None,
+        action_std: "np.ndarray | None" = None,
+        tokenizer_max_length: int = 48,
+    ):
         super().__init__()
         self._model = smolvla
         self._image_keys = image_keys or ["observation.images.top"]
@@ -164,23 +184,35 @@ class _SmolVLAWrapper(torch.nn.Module):
             self._tokenizer = smolvla.model.vlm_with_expert.processor.tokenizer
         except AttributeError:
             self._tokenizer = None
+        self._tokenizer_max_length = tokenizer_max_length
         # Detect model device so we can move batch tensors to it
         try:
             self._device = next(smolvla.parameters()).device
         except StopIteration:
             self._device = torch.device("cpu")
+        # Normalization stats (stored as CPU float32 tensors)
+        def _to_t(arr):
+            return torch.tensor(np.asarray(arr, dtype=np.float32)) if arr is not None else None
+        self._state_mean = _to_t(state_mean)
+        self._state_std  = _to_t(state_std)
+        self._action_mean = _to_t(action_mean)
+        self._action_std  = _to_t(action_std)
+
+    def reset(self) -> None:
+        """Clear the SmolVLA action queue — call at every episode reset."""
+        if hasattr(self._model, "reset"):
+            self._model.reset()
 
     def _tokenize(self, task: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (input_ids, attention_mask) tensors for a task string."""
         if self._tokenizer is None:
-            # Fallback: empty tokens if we can't reach the tokenizer
             ids = torch.zeros((1, 1), dtype=torch.long)
             return ids, torch.ones_like(ids, dtype=torch.bool)
         enc = self._tokenizer(
             task,
             return_tensors="pt",
             padding="max_length",
-            max_length=getattr(self._tokenizer, "model_max_length", 128),
+            max_length=self._tokenizer_max_length,
             truncation=True,
         )
         return enc["input_ids"], enc["attention_mask"].bool()
@@ -190,8 +222,13 @@ class _SmolVLAWrapper(torch.nn.Module):
             batch = self._to_batch(obs_dict)
             action = self._model.select_action(batch)
             if isinstance(action, torch.Tensor):
-                return action.cpu().numpy().flatten()
-            return np.asarray(action).flatten()
+                action = action.cpu()
+            else:
+                action = torch.tensor(np.asarray(action, dtype=np.float32))
+            # Denormalize: model outputs unit-scale, env expects raw [-100, 100]
+            if self._action_mean is not None and self._action_std is not None:
+                action = action * self._action_std + self._action_mean
+            return action.numpy().flatten()
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
         sv_batch = self._to_batch(batch)
@@ -204,14 +241,22 @@ class _SmolVLAWrapper(torch.nn.Module):
 
     def _to_batch(self, obs_dict: dict) -> dict:
         batch = _to_smolvla_batch(obs_dict, image_keys=self._image_keys)
+        # Normalize state: (raw - mean) / std  →  unit scale for the model
+        if "observation.state" in batch and self._state_mean is not None:
+            s = batch["observation.state"].float()
+            m = self._state_mean.to(s.device)
+            d = self._state_std.to(s.device).clamp(min=1e-8)
+            batch["observation.state"] = (s - m) / d
         # Tokenize the task instruction and add language token keys
-        task = obs_dict.get("instruction", "push the block to the goal")
+        task = obs_dict.get("instruction") or obs_dict.get("task", "pick up the cube and place it in the bin")
         if isinstance(task, list):
             task = task[0]
-        ids, mask = self._tokenize(str(task))
+        # SmolVLM tokenizer expects the prompt to end with "\n"
+        task_str = str(task).rstrip() + "\n"
+        ids, mask = self._tokenize(task_str)
         batch["observation.language.tokens"] = ids
         batch["observation.language.attention_mask"] = mask
-        # Move every tensor to the model's device (CPU → MPS or CUDA)
+        # Move every tensor to the model's device
         return {
             k: v.to(self._device) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
