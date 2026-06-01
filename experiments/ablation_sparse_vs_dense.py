@@ -232,9 +232,24 @@ class _SmolVLAWrapper(torch.nn.Module):
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
         sv_batch = self._to_batch(batch)
+        # SmolVLA.forward expects actions of shape (B, n_action_steps, action_dim).
+        # Our per-step training gives (B, action_dim), so we tile to form a valid
+        # chunk.  The gradient w.r.t. the single demonstrated action is still
+        # correct because all chunk entries are identical.
+        if "action" in sv_batch:
+            act = sv_batch["action"]
+            if act.ndim == 2:   # (B, action_dim)
+                n_steps = getattr(
+                    getattr(self._model, "config", None), "n_action_steps", 50
+                )
+                sv_batch["action"] = act.unsqueeze(1).expand(-1, n_steps, -1).contiguous()
         out = self._model.forward(sv_batch)
+        if isinstance(out, tuple):
+            # forward returns (loss_tensor, loss_dict)
+            loss_tensor = out[0]
+            return loss_tensor.mean() if loss_tensor.ndim > 0 else loss_tensor
         if isinstance(out, torch.Tensor):
-            return out
+            return out.mean() if out.ndim > 0 else out
         if hasattr(out, "loss"):
             return out.loss
         return torch.tensor(0.0, requires_grad=True)
@@ -248,7 +263,7 @@ class _SmolVLAWrapper(torch.nn.Module):
             d = self._state_std.to(s.device).clamp(min=1e-8)
             batch["observation.state"] = (s - m) / d
         # Tokenize the task instruction and add language token keys
-        task = obs_dict.get("instruction") or obs_dict.get("task", "pick up the cube and place it in the bin")
+        task = obs_dict.get("instruction") or obs_dict.get("task", "grab the cube and place it in the bin")
         if isinstance(task, list):
             task = task[0]
         # SmolVLM tokenizer expects the prompt to end with "\n"

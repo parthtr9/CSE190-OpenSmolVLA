@@ -190,7 +190,7 @@ def collect_mujoco_rollout(
     env: MuJoCoGymWrapper,
     *,
     max_steps: int = 750,
-    instruction: str = "pick up the cube and place it in the bin",
+    instruction: str = "grab the cube and place it in the bin",
 ) -> tuple[list[dict], bool]:
     """Like collect_rollout but also stores cube-bin distance for dense reward."""
     import torch as _torch
@@ -338,7 +338,7 @@ def run_experiment(
     baseline_results = []
     for ep in range(min(n_rollouts, 20)):
         _, suc = collect_mujoco_rollout(baseline_policy, env, instruction=
-                                        "pick up the cube and place it in the bin")
+                                        "grab the cube and place it in the bin")
         baseline_results.append(suc)
     baseline_sr = float(np.mean(baseline_results))
     print(f"BC baseline: {baseline_sr:.2%}  (expect ~50% with 3-position randomization)")
@@ -361,7 +361,7 @@ def run_experiment(
             for ep in range(n_rollouts):
                 traj, suc = collect_mujoco_rollout(
                     policy, env,
-                    instruction="pick up the cube and place it in the bin",
+                    instruction="grab the cube and place it in the bin",
                 )
                 rollouts.append((traj, suc))
                 successes.append(suc)
