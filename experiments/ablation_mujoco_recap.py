@@ -191,6 +191,7 @@ def collect_mujoco_rollout(
     *,
     max_steps: int = 750,
     instruction: str = "grab the cube and place it in the bin",
+    verbose: bool = True,
 ) -> tuple[list[dict], bool]:
     """Like collect_rollout but also stores cube-bin distance for dense reward."""
     import torch as _torch
@@ -205,6 +206,9 @@ def collect_mujoco_rollout(
     trajectory = []
     done = False
     success = False
+    start_dist: float | None = None
+    min_dist: float = float("inf")
+    log_steps = {0, 1, 49, 99, 249, 499, 749}  # steps to print action/dist
 
     while not done and len(trajectory) < max_steps:
         image_dict = env.render()   # {"front_camera": img, "wrist_camera": img}
@@ -221,11 +225,21 @@ def collect_mujoco_rollout(
         done = terminated or truncated
         success = bool(info.get("is_success", False))
 
-        # cube-bin distance at this step (for dense reward computation)
         dist = _cube_bin_distance(env._follower.model, env._follower.data)
+        t = len(trajectory)
+        if start_dist is None:
+            start_dist = dist
+        min_dist = min(min_dist, dist)
+
+        if verbose and t in log_steps:
+            print(
+                f"    step {t:3d} | dist {dist:.3f}m | "
+                f"act [{action_np.min():.1f}, {action_np.max():.1f}] "
+                f"mean={action_np.mean():.1f}"
+            )
 
         trajectory.append({
-            "t": len(trajectory),
+            "t": t,
             "obs": obs.astype(np.float32),
             "action": action_np.astype(np.float32),
             "image": image_dict,
@@ -237,6 +251,12 @@ def collect_mujoco_rollout(
         })
         obs = next_obs
 
+    if verbose:
+        print(
+            f"    → {'SUCCESS' if success else 'fail'} | "
+            f"steps={len(trajectory)} | "
+            f"dist: {start_dist:.3f}→{dist:.3f} (min {min_dist:.3f})"
+        )
     return trajectory, success
 
 

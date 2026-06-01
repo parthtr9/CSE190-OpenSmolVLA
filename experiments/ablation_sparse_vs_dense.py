@@ -293,12 +293,15 @@ def _img_to_tensor(image) -> "torch.Tensor":
     if isinstance(image, np.ndarray):
         img_t = torch.from_numpy(image.astype(np.float32))
         if img_t.ndim == 3:
-            img_t = img_t.permute(2, 0, 1)
+            img_t = img_t.permute(2, 0, 1)  # HWC → CHW
         if img_t.max() > 1.0:
             img_t = img_t / 255.0
-        img_t = torch.nn.functional.interpolate(
-            img_t.unsqueeze(0), size=(256, 256), mode="bilinear", align_corners=False
-        )
+        # Do NOT resize here — SmolVLA's prepare_images calls resize_with_pad
+        # internally to 512×512 while preserving aspect ratio (adding black
+        # padding).  Pre-resizing to 256×256 (square) distorts the aspect
+        # ratio so the model sees completely different visual features than
+        # it was trained on (480×640 → 384×512 + 128px top pad at training).
+        img_t = img_t.unsqueeze(0)  # (1, C, H, W) at native resolution
     else:
         img_t = image
         if img_t.ndim == 3:
