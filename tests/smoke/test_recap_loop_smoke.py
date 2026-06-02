@@ -53,6 +53,97 @@ def test_finetune_smolvla_policy_params_change(labeled_data, mock_policy):
     assert changed, "Policy parameters should change after fine-tuning"
 
 
+def test_finetune_smolvla_subsamples_large_data(mock_policy):
+    """max_labeled_steps caps FT dataset size (SmolVLA throughput fix)."""
+    from recap_smolvla.rollout import make_dummy_trajectory
+
+    big = []
+    for i in range(2000):
+        traj, _ = make_dummy_trajectory(length=2)
+        for step in traj:
+            step["instruction"] = "test task"
+            step["advantage_positive"] = i % 2 == 0
+            step["advantage"] = 1.0 if step["advantage_positive"] else -1.0
+            big.append(step)
+
+    n_calls = {"count": 0}
+    original = mock_policy.compute_loss
+
+    def counting_loss(batch):
+        n_calls["count"] += 1
+        return original(batch)
+
+    mock_policy.compute_loss = counting_loss
+    finetune_smolvla(
+        mock_policy, big, n_epochs=1, batch_size=32,
+        max_labeled_steps=64, verbose=False,
+    )
+    mock_policy.compute_loss = original
+    # 64 steps / batch_size 32 = 2 batches per epoch
+    assert n_calls["count"] == 64
+
+
+def test_finetune_smolvla_max_labeled_steps_none_uses_all(mock_policy):
+    """max_labeled_steps=None disables subsampling."""
+    from recap_smolvla.rollout import make_dummy_trajectory
+
+    data = []
+    for _ in range(40):
+        traj, _ = make_dummy_trajectory(length=1)
+        for step in traj:
+            step["instruction"] = "task"
+            step["advantage_positive"] = True
+            step["advantage"] = 1.0
+            data.append(step)
+
+    n_calls = {"count": 0}
+    original = mock_policy.compute_loss
+
+    def counting_loss(batch):
+        n_calls["count"] += 1
+        return original(batch)
+
+    mock_policy.compute_loss = counting_loss
+    finetune_smolvla(
+        mock_policy, data, n_epochs=1, batch_size=10,
+        max_labeled_steps=None, verbose=False,
+    )
+    mock_policy.compute_loss = original
+    assert n_calls["count"] == 40
+
+
+def test_smolvla_wrapper_normalizes_action_in_compute_loss():
+    """FT must normalize rollout actions before forward (raw [-100,100] → unit scale)."""
+    import torch
+    from experiments.ablation_sparse_vs_dense import _SmolVLAWrapper
+
+    mean = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    std = np.array([50.0, 50.0, 50.0, 50.0, 50.0, 50.0], dtype=np.float32)
+
+    class _FakeModel(torch.nn.Module):
+        def forward(self, batch):
+            self.last_action = batch["action"].detach().clone()
+            return torch.tensor(1.0, requires_grad=True)
+
+    wrapper = _SmolVLAWrapper(
+        _FakeModel(),
+        action_mean=mean,
+        action_std=std,
+    )
+    raw = np.full(6, 100.0, dtype=np.float32)
+    wrapper.compute_loss({
+        "observation.state": np.zeros(6, dtype=np.float32),
+        "action": raw,
+        "image": np.zeros((8, 8, 3), dtype=np.uint8),
+        "instruction": "test",
+    })
+    expected = (torch.tensor(raw) - torch.tensor(mean)) / torch.tensor(std)
+    # compute_loss tiles action to (B, n_action_steps, 6) — check one row
+    assert torch.allclose(
+        wrapper._model.last_action.reshape(-1, 6)[0], expected, atol=1e-4
+    )
+
+
 def test_finetune_smolvla_advantage_token_in_instruction(labeled_data, mock_policy):
     """The advantage token is actually prepended to at least some instructions."""
     seen_tokens = set()

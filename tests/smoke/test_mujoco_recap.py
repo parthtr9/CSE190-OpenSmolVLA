@@ -189,6 +189,39 @@ class TestRolloutWithMuJoCo:
 
 
 # ---------------------------------------------------------------------------
+# 4b. MuJoCo dense reward function (ablation_mujoco_recap)
+# ---------------------------------------------------------------------------
+
+class TestMujocoDenseRewardFn:
+    def test_dense_reward_uses_cube_bin_dist(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experiments"))
+        from ablation_mujoco_recap import _mujoco_dense_reward_fn
+
+        traj = [
+            {"cube_bin_dist": 0.30},
+            {"cube_bin_dist": 0.15},
+            {"cube_bin_dist": 0.05},
+        ]
+        rewards = _mujoco_dense_reward_fn(traj, success=True, alpha=0.1)
+        assert len(rewards) == 3
+        assert all(np.isfinite(r) for r in rewards)
+        # Terminal success step gets +1 base
+        assert rewards[-1] > rewards[0]
+
+    def test_dense_reward_failure_terminal_negative(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experiments"))
+        from ablation_mujoco_recap import _mujoco_dense_reward_fn
+
+        traj = [{"cube_bin_dist": 0.2}] * 5
+        rewards = _mujoco_dense_reward_fn(traj, success=False, alpha=0.1)
+        assert rewards[-1] < 0.0
+
+
+# ---------------------------------------------------------------------------
 # 5. Full RECAP iteration on MuJoCo (mock policy, sparse reward)
 # ---------------------------------------------------------------------------
 

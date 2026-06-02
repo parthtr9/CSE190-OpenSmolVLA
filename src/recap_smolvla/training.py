@@ -51,6 +51,9 @@ def finetune_smolvla(
     advantage_dropout: float = ADVANTAGE_DROPOUT_PROB,
     batch_size: int = 32,
     verbose: bool = False,
+    max_labeled_steps: int | None = 512,
+    ref_params: dict[str, torch.Tensor] | None = None,
+    kl_coef: float = 0.01,
 ) -> list[float]:
     """Fine-tune policy on advantage-labeled trajectory data.
 
@@ -79,6 +82,15 @@ def finetune_smolvla(
         Mini-batch size.  Steps are shuffled each epoch.
     verbose:
         Print per-epoch loss.
+    ref_params:
+        Frozen reference parameters from the original BC checkpoint
+        (``{name: param.detach().clone()}``).  When provided, an L2
+        anchor penalty ``kl_coef * ||θ - θ_ref||²`` is added to each
+        batch loss, preventing catastrophic forgetting.  Capture with
+        ``{n: p.detach().clone() for n, p in policy.named_parameters()}``
+        before the first fine-tuning call.
+    kl_coef:
+        Weight of the L2 anchor / KL-proxy regularization term.
 
     Returns
     -------
@@ -87,9 +99,29 @@ def finetune_smolvla(
     if not labeled_data:
         return []
 
+    # For VLA models (SmolVLA), each compute_loss call is a full forward pass
+    # through the vision encoder + VLM.  With 750-step rollouts × 30 episodes
+    # this can produce 22,500 labeled steps — taking 10+ hours per FT epoch.
+    # Subsample to a manageable size, balancing positive/negative advantages.
+    if max_labeled_steps and len(labeled_data) > max_labeled_steps:
+        rng_sub = np.random.default_rng(0)
+        pos = [d for d in labeled_data if d.get("advantage_positive", False)]
+        neg = [d for d in labeled_data if not d.get("advantage_positive", True)]
+        n_pos = min(len(pos), max_labeled_steps // 2)
+        n_neg = min(len(neg), max_labeled_steps - n_pos)
+        chosen_pos = rng_sub.choice(len(pos), n_pos, replace=False).tolist() if n_pos else []
+        chosen_neg = rng_sub.choice(len(neg), n_neg, replace=False).tolist() if n_neg else []
+        labeled_data = [pos[i] for i in chosen_pos] + [neg[i] for i in chosen_neg]
+        if verbose:
+            print(f"  [FT] subsampled to {len(labeled_data)} steps "
+                  f"({n_pos} pos / {n_neg} neg)")
+
     optimizer = optim.AdamW(policy.parameters(), lr=lr)
     rng = np.random.default_rng(42)
     epoch_losses: list[float] = []
+
+    was_training = policy.training
+    policy.train()
 
     for epoch in range(n_epochs):
         indices = rng.permutation(len(labeled_data)).tolist()
@@ -129,6 +161,17 @@ def finetune_smolvla(
             # Accumulate and step
             if step_losses:
                 batch_loss = torch.stack(step_losses).mean()
+
+                # L2 anchor regularization toward frozen BC reference —
+                # prevents catastrophic forgetting across RECAP iterations.
+                if ref_params is not None and kl_coef > 0.0:
+                    anchor = torch.tensor(0.0, device=batch_loss.device)
+                    for name, param in policy.named_parameters():
+                        if name in ref_params and param.requires_grad:
+                            ref = ref_params[name].to(param.device)
+                            anchor = anchor + ((param - ref) ** 2).sum()
+                    batch_loss = batch_loss + kl_coef * anchor
+
                 optimizer.zero_grad()
                 batch_loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
@@ -140,6 +183,9 @@ def finetune_smolvla(
         epoch_losses.append(mean_loss)
         if verbose:
             print(f"  FT epoch {epoch+1:3d}/{n_epochs} | loss {mean_loss:.4f}")
+
+    if not was_training:
+        policy.eval()
 
     return epoch_losses
 

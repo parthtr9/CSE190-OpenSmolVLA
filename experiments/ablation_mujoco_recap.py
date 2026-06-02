@@ -190,7 +190,7 @@ def collect_mujoco_rollout(
     env: MuJoCoGymWrapper,
     *,
     max_steps: int = 750,
-    instruction: str = "grab the cube and place it in the bin",
+    instruction: str = "pick up the cube and place it in the bin",
     verbose: bool = True,
 ) -> tuple[list[dict], bool]:
     """Like collect_rollout but also stores cube-bin distance for dense reward."""
@@ -320,10 +320,13 @@ def run_experiment(
     n_rollouts: int = 30,
     vf_epochs: int = 50,
     ft_epochs: int = 10,
+    ft_lr: float = 1e-6,
+    kl_coef: float = 0.01,
     out_dir: str = "runs/mujoco_recap",
     device: str = "cuda",
     seed: int = 0,
     max_ep_steps: int = 750,
+    reward: str = "both",
 ) -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -332,7 +335,10 @@ def run_experiment(
 
     print(f"Policy: {policy_name}  Checkpoint: {checkpoint}")
     print(f"Env: MuJoCo SO-101 cube-bin, 3-position cube randomization, max {max_ep_steps} steps")
-    print(f"RECAP: {n_iters} iters × {n_rollouts} rollouts, VF={vf_epochs}ep, FT={ft_epochs}ep")
+    print(
+        f"RECAP: {n_iters} iters × {n_rollouts} rollouts, "
+        f"VF={vf_epochs}ep, FT={ft_epochs}ep @ lr={ft_lr}  kl_coef={kl_coef}"
+    )
 
     env = MuJoCoGymWrapper(randomize_cube=True, max_steps=max_ep_steps)
     obs_dim = env.observation_space.shape[0]   # 6
@@ -342,10 +348,16 @@ def run_experiment(
             return _load_smolvla(checkpoint, device=device)
         return _MockPolicy()
 
-    reward_configs = {
+    _all_reward_configs = {
         "sparse": sparse_reward_fn,
         "dense": _mujoco_dense_reward_fn,
     }
+    if reward == "both":
+        reward_configs = _all_reward_configs
+    elif reward in _all_reward_configs:
+        reward_configs = {reward: _all_reward_configs[reward]}
+    else:
+        raise ValueError(f"--reward must be 'sparse', 'dense', or 'both'; got {reward!r}")
 
     results: dict = {
         "sparse": {"success_rates": [], "pct_positive": [], "advantages": []},
@@ -358,7 +370,7 @@ def run_experiment(
     baseline_results = []
     for ep in range(min(n_rollouts, 20)):
         _, suc = collect_mujoco_rollout(baseline_policy, env, instruction=
-                                        "grab the cube and place it in the bin")
+                                        "pick up the cube and place it in the bin")
         baseline_results.append(suc)
     baseline_sr = float(np.mean(baseline_results))
     print(f"BC baseline: {baseline_sr:.2%}  (expect ~50% with 3-position randomization)")
@@ -372,6 +384,17 @@ def run_experiment(
         policy = load_policy()
         value_fn = ValueFunction(obs_dim=obs_dim)
 
+        # Capture frozen BC reference weights once per reward phase.
+        # Used as L2 anchor during fine-tuning to prevent catastrophic forgetting.
+        ref_params: dict | None = None
+        if kl_coef > 0.0:
+            ref_params = {
+                n: p.detach().clone()
+                for n, p in policy.named_parameters()
+                if p.requires_grad
+            }
+            print(f"  [KL anchor] captured {len(ref_params)} param tensors, coef={kl_coef}")
+
         for it in range(n_iters):
             print(f"\n  Iteration {it + 1}/{n_iters}")
 
@@ -381,7 +404,7 @@ def run_experiment(
             for ep in range(n_rollouts):
                 traj, suc = collect_mujoco_rollout(
                     policy, env,
-                    instruction="grab the cube and place it in the bin",
+                    instruction="pick up the cube and place it in the bin",
                 )
                 rollouts.append((traj, suc))
                 successes.append(suc)
@@ -401,7 +424,10 @@ def run_experiment(
             pct_pos = stats.get("pct_positive", 0.0)
 
             from recap_smolvla.training import finetune_smolvla
-            finetune_smolvla(policy, labeled, n_epochs=ft_epochs, verbose=True)
+            finetune_smolvla(
+                policy, labeled, n_epochs=ft_epochs, lr=ft_lr, verbose=True,
+                ref_params=ref_params, kl_coef=kl_coef,
+            )
 
             results[reward_name]["success_rates"].append(sr)
             results[reward_name]["pct_positive"].append(pct_pos)
@@ -445,12 +471,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--n_rollouts", type=int, default=30)
     p.add_argument("--vf_epochs", type=int, default=50)
     p.add_argument("--ft_epochs", type=int, default=10)
+    p.add_argument(
+        "--ft_lr", type=float, default=1e-6,
+        help="AdamW LR for SmolVLA FT (default 1e-6; 1e-5 often diverges)",
+    )
+    p.add_argument(
+        "--kl_coef", type=float, default=0.01,
+        help="L2 anchor penalty toward frozen BC weights (0 disables, 0.01 default)",
+    )
     p.add_argument("--out_dir", default="runs/mujoco_recap")
     p.add_argument("--device", default="cuda",
                    help="Torch device for policy inference (cuda/cpu/mps)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_ep_steps", type=int, default=750,
                    help="Max steps per episode (default 750 = 25s at 30Hz; use 200 for faster runs)")
+    p.add_argument(
+        "--reward", choices=["sparse", "dense", "both"], default="both",
+        help="Which reward variant to run: 'sparse', 'dense', or 'both' (default both)",
+    )
     return p.parse_args()
 
 
@@ -463,8 +501,11 @@ if __name__ == "__main__":
         n_rollouts=args.n_rollouts,
         vf_epochs=args.vf_epochs,
         ft_epochs=args.ft_epochs,
+        ft_lr=args.ft_lr,
+        kl_coef=args.kl_coef,
         out_dir=args.out_dir,
         device=args.device,
         seed=args.seed,
         max_ep_steps=args.max_ep_steps,
+        reward=args.reward,
     )

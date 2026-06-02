@@ -211,7 +211,7 @@ class _SmolVLAWrapper(torch.nn.Module):
         enc = self._tokenizer(
             task,
             return_tensors="pt",
-            padding="max_length",
+            padding="longest",
             max_length=self._tokenizer_max_length,
             truncation=True,
         )
@@ -228,10 +228,10 @@ class _SmolVLAWrapper(torch.nn.Module):
             # Denormalize: model outputs unit-scale, env expects raw [-100, 100]
             if self._action_mean is not None and self._action_std is not None:
                 action = action * self._action_std + self._action_mean
-            return action.numpy().flatten()
+            return np.clip(action.numpy().flatten(), -100.0, 100.0)
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
-        sv_batch = self._to_batch(batch)
+        sv_batch = self._to_batch(batch, normalize_action=True)
         # SmolVLA.forward expects actions of shape (B, n_action_steps, action_dim).
         # Our per-step training gives (B, action_dim), so we tile to form a valid
         # chunk.  The gradient w.r.t. the single demonstrated action is still
@@ -254,7 +254,7 @@ class _SmolVLAWrapper(torch.nn.Module):
             return out.loss
         return torch.tensor(0.0, requires_grad=True)
 
-    def _to_batch(self, obs_dict: dict) -> dict:
+    def _to_batch(self, obs_dict: dict, *, normalize_action: bool = False) -> dict:
         batch = _to_smolvla_batch(obs_dict, image_keys=self._image_keys)
         # Normalize state: (raw - mean) / std  →  unit scale for the model
         if "observation.state" in batch and self._state_mean is not None:
@@ -262,8 +262,14 @@ class _SmolVLAWrapper(torch.nn.Module):
             m = self._state_mean.to(s.device)
             d = self._state_std.to(s.device).clamp(min=1e-8)
             batch["observation.state"] = (s - m) / d
+        # Rollout actions are denormalized [-100, 100]; forward() expects unit scale.
+        if normalize_action and "action" in batch and self._action_mean is not None:
+            a = batch["action"].float()
+            m = self._action_mean.to(a.device)
+            d = self._action_std.to(a.device).clamp(min=1e-8)
+            batch["action"] = (a - m) / d
         # Tokenize the task instruction and add language token keys
-        task = obs_dict.get("instruction") or obs_dict.get("task", "grab the cube and place it in the bin")
+        task = obs_dict.get("instruction") or obs_dict.get("task", "pick up the cube and place it in the bin")
         if isinstance(task, list):
             task = task[0]
         # SmolVLM tokenizer expects the prompt to end with "\n"
