@@ -2,6 +2,10 @@
 
 SmolVLA fine-tuned with RECAP (Reinforcement Learning with Advantage-Conditioned Policy optimization) for robotic manipulation in MuJoCo.
 
+Starting from the pre-trained BC checkpoint [`Gueso/hf_smolvla_recordpolicy0`](https://huggingface.co/Gueso/hf_smolvla_recordpolicy0) (~50% success rate with 3-position cube randomization), RECAP iteratively fine-tunes the policy using advantage-weighted supervision.
+
+---
+
 ## Quick Start
 
 ### Prerequisites
@@ -32,6 +36,15 @@ print(f'OK: {model.nbody} bodies, {model.ngeom} geoms, {model.nu} actuators')
 "
 ```
 
+### Verify the RECAP module
+
+```bash
+uv run python -c "from recap_smolvla import MuJoCoGymWrapper; print('OK')"
+uv run python -c "from smolvla_recap.env.mujoco_follower import MuJoCoFollower; print('OK')"
+```
+
+> **MuJoCo note:** MuJoCo 3.x is a pure-Python wheel — no license file or system install needed.
+
 ---
 
 ## Project Structure
@@ -43,13 +56,35 @@ CSE190-OpenSmolVLA/
 │   ├── record_sim.py          # Record teleoperation demos (leader arm -> sim)
 │   └── eval_sim.py            # Run a trained policy in sim and watch it
 │
-├── src/smolvla_recap/
-│   └── env/
-│       ├── mujoco_follower.py # Core sim interface (observation, action, reset)
-│       └── assets/
-│           ├── so101_tabletop.xml  # MuJoCo scene: arm + table + cube + bin
-│           └── *.stl              # Robot mesh files
+├── src/
+│   ├── smolvla_recap/         # Simulation package
+│   │   └── env/
+│   │       ├── mujoco_follower.py  # Core sim interface (observation, action, reset)
+│   │       └── assets/
+│   │           ├── so101_tabletop.xml  # MuJoCo scene: arm + table + cube + bin
+│   │           └── *.stl              # Robot mesh files
+│   │
+│   └── recap_smolvla/         # RECAP algorithm package
+│       ├── envs/
+│       │   └── mujoco_env.py       # MuJoCoGymWrapper — gym interface
+│       ├── rewards.py              # sparse_reward_fn, dense_reward_fn
+│       ├── value_function.py       # MLP value function + return computation
+│       ├── advantage.py            # Advantage calculation + binary labeling (~30% positive)
+│       ├── rollout.py              # Gymnasium-compatible rollout collector
+│       ├── scoring.py              # VLA self-scoring
+│       ├── curriculum.py           # Curriculum learning
+│       ├── data.py                 # Data adapter
+│       └── training.py            # recap_training_iteration — full RECAP loop
 │
+├── experiments/
+│   ├── ablation_mujoco_recap.py     # Main experiment: sparse vs dense on SO-101
+│   ├── ablation_sparse_vs_dense.py  # General ablation (also supports --env mujoco)
+│   ├── ablation_vla_scoring.py      # Direction 2: VLA self-scoring
+│   ├── ablation_curriculum.py       # Direction 3: curriculum learning
+│   └── run_all_ablations.py         # Run all ablation experiments
+│
+├── tests/                     # Test suite (smoke, unit, gradient, integration)
+├── results/                   # Ablation results and plots
 ├── pyproject.toml             # Dependencies (managed by uv)
 ├── .env.example               # Template for API keys
 └── uv.lock                    # Locked dependency versions
@@ -57,13 +92,11 @@ CSE190-OpenSmolVLA/
 
 ---
 
-## What Each File Does
+## Scripts
 
-### Scripts
+### `scripts/viewer.py` — View the Scene
 
-#### `scripts/viewer.py` -- View the Scene
-
-Opens an interactive 3D viewer showing the SO-101 arm, table, cube, and bin. Use this to visually inspect the environment. Mouse to orbit/zoom.
+Opens an interactive 3D viewer showing the SO-101 arm, table, cube, and bin. Mouse to orbit/zoom.
 
 ```bash
 uv run python scripts/viewer.py
@@ -71,11 +104,9 @@ uv run python scripts/viewer.py
 
 > Requires a display. If SSH'd in, use X-forwarding (`ssh -X`).
 
----
+### `scripts/record_sim.py` — Record Demonstrations
 
-#### `scripts/record_sim.py` -- Record Demonstrations
-
-Records human teleoperation data. You need a physical SO-101 leader arm connected via USB. Your hand movements on the leader arm are mirrored into the MuJoCo simulation, and observations + actions are saved as a LeRobot dataset.
+Records human teleoperation data. You need a physical SO-101 leader arm connected via USB. Movements on the leader arm are mirrored into MuJoCo, and observations + actions are saved as a LeRobot dataset.
 
 ```bash
 uv run python scripts/record_sim.py \
@@ -94,22 +125,12 @@ uv run python scripts/record_sim.py \
 | `d`     | Discard current episode (redo)      |
 | `q`     | Quit recording                      |
 
-**Output:** A LeRobot-format dataset with:
-- `observation.state` -- 6 joint angles (float32)
-- `observation.images.front_camera` -- 480x640 RGB from fixed camera
-- `observation.images.wrist_camera` -- 480x640 RGB from gripper camera
-- `action` -- 6 joint commands (float32)
+### `scripts/eval_sim.py` — Evaluate a Trained Policy
 
----
+Loads a trained SmolVLA checkpoint and runs it autonomously in MuJoCo. Two modes:
 
-#### `scripts/eval_sim.py` -- Evaluate a Trained Policy
-
-Loads a trained SmolVLA checkpoint and runs it autonomously in the MuJoCo simulation. Two modes:
-
-- **Viewer mode** (default): Opens a MuJoCo window to watch live. Requires a display.
-- **Video mode** (`--save-video`): Runs headless, saves MP4 videos of each episode. Works over SSH.
-
-The script also automatically detects success (cube lands in bin) and prints a success rate summary.
+- **Viewer mode** (default): Opens a MuJoCo window to watch live.
+- **Video mode** (`--save-video`): Runs headless, saves MP4s. Works over SSH.
 
 ```bash
 # Interactive with viewer (needs display):
@@ -125,10 +146,6 @@ uv run python scripts/eval_sim.py \
     --device cuda
 ```
 
-Videos are saved as side-by-side front + wrist camera views to `outputs/eval_videos/`.
-
-**All options:**
-
 | Flag             | Default | Description |
 |------------------|---------|-------------|
 | `--checkpoint`   | (required) | Path to checkpoint dir or HuggingFace repo ID |
@@ -140,43 +157,41 @@ Videos are saved as side-by-side front + wrist camera views to `outputs/eval_vid
 | `--save-video`   | off | Run headless, save MP4 videos |
 | `--video-dir`    | `outputs/eval_videos` | Where to save videos |
 
-In viewer mode, press `Enter` between episodes. `Ctrl-C` to quit early.
+---
 
-**Example output:**
+## How RECAP Works
+
 ```
-=== Episode 1/20 ===
-  Success detected at step 187!
-  [SUCCESS] 300 steps in 4.2s
-...
-========================================
-Results: 18/20 episodes succeeded (90%)
-========================================
-Videos saved to: /home/user/Projects/CSE190-OpenSmolVLA/outputs/eval_videos
+For each iteration:
+  1. Collect N rollouts with the current policy in MuJoCo
+     (cube randomized across 3 positions each episode)
+
+  2. Compute discounted returns  R_t = Σ_{t'>=t} γ^(t'-t) r_{t'}
+
+  3. Train an MLP value function  V_φ(s) to predict R_t via regression
+
+  4. Compute advantages  A(s,a) = R_t − V_φ(s)
+
+  5. Label top-30% advantage steps as "positive" → binary labels b_t ∈ {0,1}
+
+  6. Fine-tune SmolVLA with advantage-weighted cross-entropy loss:
+       L = −Σ_t b_t · log π_θ(a_t | s_t)
+
+Repeat → policy learns to imitate its own best behaviors.
 ```
+
+**Sparse reward:** `r_t = -1` per step, `0` on success
+**Dense reward:** `r_t = -1/T + α·(1 − dist(cube, bin)/max_dist)` per step
+
+The dense variant gives the value function a smoother signal to learn from, which is the core hypothesis of the ablation.
 
 ---
 
-### Source Code (library)
+## Training
 
-#### `src/smolvla_recap/env/mujoco_follower.py` -- Simulation Interface
+### Phase 1: Behavioral Cloning
 
-The core class `MuJoCoFollower` that wraps MuJoCo. It provides the same interface as a physical SO-101 robot arm:
-
-| Method | What it does |
-|--------|-------------|
-| `connect(viewer=True)` | Load the MuJoCo model, set up cameras, optionally open viewer |
-| `get_observation()` | Returns `{"state": (6,), "front_camera": (480,640,3), "wrist_camera": (480,640,3)}` |
-| `send_action({"joint.pos": value})` | Send normalized joint commands, step physics |
-| `reset(keyframe="ready")` | Reset scene to a known pose (arm + cube positions) |
-| `disconnect()` | Clean up resources |
-
-Joint values are **normalized**: [-100, 100] for body joints, [0, 100] for gripper.
-
----
-
-## Training a Policy
-
-Training uses LeRobot's training script with a SmolVLA config. Here's the command that produced the current checkpoint:
+Training uses LeRobot's training script with a SmolVLA config:
 
 ```bash
 uv run python -m lerobot.scripts.train \
@@ -191,8 +206,6 @@ uv run python -m lerobot.scripts.train \
     --policy.repo_id=YourUsername/your_model_name
 ```
 
-**Key training parameters from the current run:**
-
 | Parameter | Value |
 |-----------|-------|
 | Dataset | `Gueso/so101_cube_bin_v2` (200 episodes, 70,943 frames) |
@@ -200,42 +213,43 @@ uv run python -m lerobot.scripts.train \
 | Steps | 20,000 (~18 epochs) |
 | Batch size | 64 |
 | LR schedule | Cosine decay, peak 1e-4, warmup 1000 steps |
-| Normalization | MEAN_STD for state/action, IDENTITY for images |
-| Images | Resized to 512x512 with padding |
-| Action chunk | 50 steps |
 | VLM backbone | `HuggingFaceTB/SmolVLM2-500M-Video-Instruct` (frozen) |
 
-Final training loss: **0.091** (from 1.549 initial).
+### Phase 2: RECAP Fine-tuning
 
-### Training with Fewer Episodes
-
-To train on a subset of episodes (e.g., for creating a weaker baseline policy for RECAP experiments), use the `--dataset.episodes` flag:
+Run the RECAP ablation with the BC checkpoint:
 
 ```bash
-# Train on only the first 50 episodes (out of 200)
-uv run python -m lerobot.scripts.train \
-    --policy.type=smolvla \
-    --dataset.repo_id=Gueso/so101_cube_bin_v2 \
-    '--dataset.episodes=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49]' \
-    --output_dir=outputs/train/50ep_baseline \
-    --batch_size=64 \
-    --steps=20000 \
-    --policy.device=cuda
+# Local (CPU, for verification)
+uv run python experiments/ablation_mujoco_recap.py \
+  --checkpoint Gueso/hf_smolvla_recordpolicy0 \
+  --n_iters 2 --n_rollouts 5 --vf_epochs 10 --ft_epochs 3 \
+  --device cpu \
+  --out_dir runs/mujoco_recap_local
+
+# GPU (full experiment)
+uv run python experiments/ablation_mujoco_recap.py \
+  --checkpoint Gueso/hf_smolvla_recordpolicy0 \
+  --n_iters 5 --n_rollouts 30 --vf_epochs 50 --ft_epochs 10 \
+  --out_dir runs/mujoco_recap
 ```
 
-Or generate the episode list in Python:
+This will:
+1. Download the BC checkpoint from HuggingFace
+2. Measure the BC baseline success rate (~50% with cube randomization)
+3. Run RECAP iterations for **sparse** and **dense** reward
+4. Save plots and a JSON results file
+
+---
+
+## Running Tests
 
 ```bash
-# Generate the episode indices and pass them
-EPISODES=$(python -c "print('[' + ','.join(str(i) for i in range(50)) + ']')")
-uv run python -m lerobot.scripts.train \
-    --policy.type=smolvla \
-    --dataset.repo_id=Gueso/so101_cube_bin_v2 \
-    "--dataset.episodes=$EPISODES" \
-    --output_dir=outputs/train/50ep_baseline \
-    --batch_size=64 \
-    --steps=20000 \
-    --policy.device=cuda
+# Fast tests (no GPU, no HuggingFace download)
+uv run python -m pytest tests/ -m "not slow and not integration" -q
+
+# MuJoCo-specific smoke tests only
+uv run python -m pytest tests/smoke/test_mujoco_recap.py -v
 ```
 
 ---
@@ -246,11 +260,14 @@ uv run python -m lerobot.scripts.train \
 1. Record demos        -->  scripts/record_sim.py
    (leader arm + sim)       Saves LeRobot dataset to HF Hub
 
-2. Train policy         -->  lerobot.scripts.train
-   (BC on demos)             Saves checkpoint to HF Hub
+2. Train BC policy     -->  lerobot.scripts.train
+   (supervised on demos)    Saves checkpoint to HF Hub
 
-3. Evaluate policy      -->  scripts/eval_sim.py
-   (watch it in sim)         Loads checkpoint, runs in MuJoCo viewer
+3. Evaluate BC         -->  scripts/eval_sim.py
+   (baseline SR)            Runs in MuJoCo viewer or saves video
+
+4. RECAP fine-tuning   -->  experiments/ablation_mujoco_recap.py
+   (advantage-weighted)     Iterative improvement over BC baseline
 ```
 
 ---
@@ -267,6 +284,15 @@ uv run python -m lerobot.scripts.train \
 | **Table** | 80cm x 60cm surface at 40cm height |
 | **Cameras** | `front_camera` (fixed, 50° FOV), `wrist_camera` (gripper-mounted, 70.5° FOV) |
 
+| Setting | Value |
+|---|---|
+| Observation | Joint positions, 6-D float32 |
+| Action | Target joint positions, 6-D float32 |
+| Cameras | `front_camera` 480x640x3, `wrist_camera` 480x640x3 |
+| Max steps | 750 (25 s at 30 Hz) |
+| Success threshold | Cube within 3 cm horizontal + 0-5 cm vertical of bin site |
+| BC baseline SR | ~50% with 3-position randomization |
+
 ### Robot Joints
 
 | Joint | Range (normalized) | Description |
@@ -278,33 +304,31 @@ uv run python -m lerobot.scripts.train \
 | `wrist_roll` | [-100, 100] | Wrist roll |
 | `gripper` | [0, 100] | Gripper open/close |
 
-### Keyframes
+### Cube Randomization
 
-- **`home`**: Arm folded, gripper closed
-- **`ready`**: Arm extended forward, gripper open (pre-grasp position)
+The environment cycles through 3 positions every episode to test generalization:
+
+| Index | X (m) | Y (m) |
+|---|---|---|
+| 0 | -0.10 | -0.05 |
+| 1 | -0.13 | -0.05 |
+| 2 | -0.10 | -0.02 |
 
 ---
 
-## Project Roadmap
+## Troubleshooting
 
-### Phase 1: BC Pre-training 
+**`ImportError: No module named 'smolvla_recap'`**
+- Run `uv sync` or `pip install -e .` from the repo root.
 
-1. Collect teleoperated demos in MuJoCo sim
-2. Fine-tune SmolVLA with behavioral cloning
-3. Evaluate BC baseline success rate
+**`ModuleNotFoundError: lerobot`**
+- Run `pip install "lerobot>=0.5.1"`.
 
-### Phase 2: RECAP Training
+**MuJoCo segfault on headless server**
+- Set `headless=True` (default) in `MuJoCoGymWrapper`. MuJoCo 3.x renders off-screen without a display.
 
-1. Roll out BC policy to collect autonomous trajectories
-2. Train value function V(s) on rollout returns
-3. Compute advantages A = return - V(s), select top positive-advantage transitions
-4. Re-fine-tune SmolVLA conditioned on advantage signal
-5. Compare RECAP vs BC baseline
+**HuggingFace download slow on cluster**
+- Set `export HF_HOME=/tmp/$USER/hf` to use fast local storage.
 
-### Reward Modeling Ablation
-
-| Reward Type | Description |
-|-------------|-------------|
-| **State-based** | Ground-truth from simulator (cube position, contact sensors) |
-| **VLM-based** | Score frames with a VLM ("is the cube in the bin?") |
-| **Learned** | Small classifier trained on success/fail labels |
+**Out of GPU memory during fine-tuning**
+- Reduce `--n_rollouts` or `--ft_epochs`. SmolVLA is ~450M params; 16 GB VRAM is comfortable with batch size 1.

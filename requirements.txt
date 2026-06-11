@@ -1,0 +1,32 @@
+# -----------------------------------------------------------------------
+# recap-smolvla requirements
+#
+# Recommended: use the conda environment instead of installing directly:
+#   conda env create -f environment.yml
+#   conda activate recap-smolvla
+#
+# The key constraint: lerobot 0.5.x requires huggingface-hub>=1.0, which
+# conflicts with transformers<4.46. Installing lerobot first lets pip
+# resolve a compatible transformers version automatically.
+# -----------------------------------------------------------------------
+
+# PyTorch (arm64 / x86 wheels available on PyPI)
+torch>=2.7,<2.11
+torchvision>=0.22,<0.26
+
+# Robotics stack
+lerobot==0.5.1
+num2words              # required by SmolVLM processor
+gym_pusht==0.1.6
+pymunk<7.0          # gym_pusht uses the pymunk 6.x API (add_collision_handler)
+
+# Core utilities
+numpy>=2.0,<2.3
+gymnasium>=1.1.1,<2.0
+matplotlib>=3.8.0
+tqdm>=4.66.0
+
+# Dev / testing
+pytest>=8.0.0
+pytest-cov>=5.0.0
+pytest-timeout>=2.3.0

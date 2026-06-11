@@ -1,0 +1,29 @@
+name: cse190_final
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    # PyTorch — install via pip to get the right lerobot-compatible version
+    - torch>=2.7,<2.11
+    - torchvision>=0.22,<0.26
+    # Core robotics stack — lerobot first so pip resolves hub/transformers together
+    - lerobot==0.5.1
+    - transformers>=4.46.0
+    - num2words              # required by SmolVLM processor
+    - gym_pusht==0.1.6
+    - pymunk<7.0          # gym_pusht uses the pymunk 6.x collision API
+    # Core utilities
+    - numpy>=2.0,<2.3
+    - gymnasium>=1.1.1,<2.0
+    - matplotlib>=3.8.0
+    - tqdm>=4.66.0
+    # This project
+    - -e .
+    # Dev / testing
+    - pytest>=8.0.0
+    - pytest-cov>=5.0.0
+    - pytest-timeout>=2.3.0
