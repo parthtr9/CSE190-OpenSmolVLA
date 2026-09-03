@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-
 # ---------------------------------------------------------------------------
 # Return computation
 # ---------------------------------------------------------------------------
@@ -178,6 +177,7 @@ def train_value_function(
     epochs: int = 100,
     lr: float = 1e-3,
     gamma: float = 1.0,
+    feature_key: str = "obs",
     verbose: bool = False,
 ) -> list[float]:
     """Train value_fn to predict cumulative returns via MSE loss.
@@ -196,6 +196,9 @@ def train_value_function(
         AdamW learning rate.
     gamma:
         Discount factor passed to compute_returns.
+    feature_key:
+        Per-step feature field used by the value function.  Defaults to
+        ``"obs"``; use ``"latent"`` after world-model augmentation.
     verbose:
         Print epoch losses when True.
 
@@ -219,7 +222,7 @@ def train_value_function(
             returns = compute_returns(rewards, gamma=gamma)
 
             obs = torch.from_numpy(
-                np.stack([step["obs"] for step in trajectory]).astype(np.float32)
+                np.stack([step[feature_key] for step in trajectory]).astype(np.float32)
             )
             targets = torch.tensor(returns, dtype=torch.float32)
 

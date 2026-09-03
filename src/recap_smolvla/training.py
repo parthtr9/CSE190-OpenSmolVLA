@@ -21,10 +21,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from recap_smolvla.advantage import label_trajectories, advantage_distribution_stats
+from recap_smolvla.advantage import advantage_distribution_stats, label_trajectories
 from recap_smolvla.rollout import collect_rollout
 from recap_smolvla.value_function import ValueFunction, train_value_function
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -208,6 +207,7 @@ def recap_training_iteration(
     gamma: float = 1.0,
     max_steps: int = 300,
     instruction: str = "push the block to the goal",
+    feature_key: str = "obs",
     verbose: bool = True,
 ) -> tuple[float, nn.Module, ValueFunction, dict[str, Any]]:
     """Execute one full RECAP training iteration.
@@ -244,6 +244,10 @@ def recap_training_iteration(
         Episode length cap.
     instruction:
         Language instruction for the task.
+    feature_key:
+        Per-step representation field for value/advantage estimation.  Keep
+        the default ``"obs"`` for baseline RECAP or set ``"latent"`` after
+        augmenting rollouts with the frozen world-model encoder.
     verbose:
         Print progress.
 
@@ -279,6 +283,7 @@ def recap_training_iteration(
         reward_fn,
         epochs=vf_epochs,
         gamma=gamma,
+        feature_key=feature_key,
         verbose=verbose,
     )
 
@@ -291,6 +296,7 @@ def recap_training_iteration(
         reward_fn,
         threshold_pct=advantage_threshold_pct,
         gamma=gamma,
+        feature_key=feature_key,
     )
 
     stats = advantage_distribution_stats(labeled_data)

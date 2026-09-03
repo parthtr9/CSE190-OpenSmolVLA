@@ -10,7 +10,7 @@ Starting from the pre-trained BC checkpoint [`Gueso/hf_smolvla_recordpolicy0`](h
 
 ### Prerequisites
 
-- Python >= 3.10
+- Python >= 3.12 (required by the pinned LeRobot version)
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
 - A display server (X11/Wayland) for the MuJoCo viewer, or use headless rendering
 - CUDA GPU recommended for training and inference (CPU works but is slow)
@@ -188,6 +188,44 @@ The dense variant gives the value function a smoother signal to learn from, whic
 ---
 
 ## Training
+
+### Latent dynamics world model (foundation)
+
+`recap_smolvla.world_model` provides the trainable half of a V-JEPA-2-AC-style
+world model: a *frozen* encoder produces latent features and a small causal,
+action-conditioned transformer predicts the next latent with L1 loss. The
+default `StateEncoder` is only for the existing state-only simulator and unit
+tests. For the actual robot experiment, replace it with an adapter around a
+released video-pretrained encoder whose `forward(B, T, ...)` returns
+`(B, T, latent_dim)` features; do not train that encoder on the robot dataset.
+
+```python
+from recap_smolvla.world_model import (
+    ActionConditionedLatentWorldModel, StateEncoder, rollout_batches,
+    train_world_model, augment_rollouts_with_latents,
+)
+from recap_smolvla.value_function import ValueFunction, train_value_function
+
+# Replace StateEncoder with the frozen V-JEPA visual encoder in real runs.
+wm = ActionConditionedLatentWorldModel(
+    StateEncoder(input_dim=6, latent_dim=256),
+    latent_dim=256, action_dim=6, predictor_dim=256,
+)
+train_world_model(wm, rollout_batches(rollouts), epochs=50, lr=1e-4)
+
+# RECAP value learning now consumes the frozen predictive representation.
+latent_rollouts = augment_rollouts_with_latents(rollouts, wm)
+latent_value = ValueFunction(obs_dim=256)
+train_value_function(latent_rollouts, latent_value, reward_fn, feature_key="latent")
+```
+
+To use the compiled batched MJX seam, install the optional dependency with
+`uv sync --extra mjx`. This installs JAX and the separate `mujoco-mjx`
+package. `recap_smolvla.mjx.make_batched_step` compiles and
+vectorizes a pure task-specific `step_fn(data, action)`, leaving reward,
+resets, termination, and domain randomization explicit in the SO-101 task
+implementation. The current Python `MuJoCoGymWrapper` remains the reference
+environment until that task's MuJoCo model/reset logic is ported to pure MJX.
 
 ### Phase 1: Behavioral Cloning
 

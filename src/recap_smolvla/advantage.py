@@ -21,7 +21,6 @@ import torch
 
 from recap_smolvla.value_function import ValueFunction, compute_returns
 
-
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -43,6 +42,7 @@ def compute_advantages(
     success: bool,
     *,
     gamma: float = 1.0,
+    feature_key: str = "obs",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute per-step advantages A_t = G_t - V(s_t).
 
@@ -58,6 +58,8 @@ def compute_advantages(
         Episode outcome, forwarded to reward_fn.
     gamma:
         Discount factor (matches value function training).
+    feature_key:
+        Per-step representation field supplied to ``value_fn``.
 
     Returns
     -------
@@ -71,7 +73,7 @@ def compute_advantages(
     returns = np.array(compute_returns(rewards, gamma=gamma), dtype=np.float32)
 
     obs = torch.tensor(
-        np.stack([step["obs"] for step in trajectory]).astype(np.float32)
+        np.stack([step[feature_key] for step in trajectory]).astype(np.float32)
     )
     with torch.no_grad():
         values = value_fn(obs).numpy()
@@ -91,6 +93,7 @@ def label_trajectories(
     *,
     threshold_pct: float = 70.0,
     gamma: float = 1.0,
+    feature_key: str = "obs",
 ) -> list[LabeledStep]:
     """Label every trajectory step with a binary advantage indicator.
 
@@ -113,6 +116,8 @@ def label_trajectories(
         Percentile below which steps are labeled negative (default 70).
     gamma:
         Discount factor.
+    feature_key:
+        Per-step representation field supplied to ``value_fn``.
 
     Returns
     -------
@@ -131,7 +136,7 @@ def label_trajectories(
 
     for trajectory, success in rollouts:
         advs, rets = compute_advantages(
-            trajectory, value_fn, reward_fn, success, gamma=gamma
+            trajectory, value_fn, reward_fn, success, gamma=gamma, feature_key=feature_key
         )
         per_rollout.append((advs, rets))
         all_advantages.extend(advs.tolist())
